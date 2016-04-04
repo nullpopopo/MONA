@@ -1,0 +1,86 @@
+#!/bin/bash
+set -uex
+LANG=C
+
+EventID=${1:-test0001}
+NOTIFYTIME=${2:-5hour}
+
+MTA=mail.example.com
+MAILFROM=admin@example.com
+MAILTO=nullpopopo@example.com
+
+PROGNAME=$(basename ${0})
+PROJECTNAME=MESH
+BASEDIR=${HOME}/Dropbox
+TRIGGERDIR=${BASEDIR}/APPS/${PROGNAME}
+TRIGGERFILE=${TRIGGERDIR}/${EventID}.txt
+[ ! -f ${TRIGGERFILE} ] && exit 1
+TRIGGER_TIMESTAMP_ORIG=$(ls -l --time-style="+%s" ${TRIGGERFILE} | awk '{print $6}')
+TRIGGER_TIMESTAMP_DATE="$(ls -l --time-style="+%Y-%m-%d %H:%M" ${TRIGGERFILE} | awk '{print $6,$7}')"
+
+MSG0001="Washing machine has started at ${TRIGGER_TIMESTAMP_DATE}"
+SUBJECT0001="[${PROJECTNAME}][${EventID}] ${MSG0001}"
+
+# Dropboxの同期ができていなければDropboxを再起動させて異常終了させる。
+DROPBOXPY_STATUS=$(dropbox.py status | egrep '(最新の状態|Up to date)' > /dev/null ; echo $?)
+if [ ! 0 = ${DROPBOXPY_STATUS} ];
+then
+  dropbox.py stop
+  dropbox.py start
+  exit 1
+fi
+
+mkdir -p ${BASEDIR} ${TRIGGERDIR}
+
+if [ $# = 2 ];
+then
+  case "$2" in
+  [0-9]*[mM][iI][nN])
+    INPUTTIME=$(echo ${NOTIFYTIME} | sed -e "s/[mM][iI][nN]//")
+    CALCNUM=60
+  ;;
+  [0-9]*[hH][oO][uU][rR])
+    INPUTTIME=$(echo ${NOTIFYTIME} | sed -e "s/[hH][oO][uU][rR]//")
+    CALCNUM=3600
+  ;;
+  [0-9\.]*)
+    # 入力された数値を時間とみなす。上限は24時間。
+    if [ 0 = $(echo "${NOTIFYTIME} < 24" | bc > /dev/null ; echo $?) ];
+    then
+      INPUTTIME=${NOTIFYTIME}
+      CALCNUM=3600
+    else
+      INPUTTIME=24
+      CALCNUM=3600
+    fi
+  ;;
+  *)
+    exit 1
+  ;;
+  esac
+else
+  INPUTTIME=$(echo ${NOTIFYTIME} | sed -e "s/[hH][oO][uU][rR]//")
+  CALCNUM=3600
+fi
+
+BC0=${TRIGGER_TIMESTAMP_ORIG}
+BC1=$(echo ${CALCNUM} \* ${INPUTTIME} | bc)
+OUTPUTTIME=$(echo ${BC0} + ${BC1} | bc | awk 'BEGIN {FS="."}{print $1}')
+OUTPUTTIME_DATE=$(echo ${OUTPUTTIME} | awk '{print strftime("%Y-%m-%d %H:%M",$1)}')
+OUTPUTFILE=${TRIGGERDIR}/ENDNOTIFY_${EventID}.txt
+echo ${OUTPUTTIME} | tee ${OUTPUTFILE}
+
+cat ${TRIGGERFILE} | sed -e "s/[[:space:]]/\n/g;s/$/\n/"              | \
+    sed -e "s/_BEGIN_/${EventID} Started: ${TRIGGER_TIMESTAMP_DATE}/" | \
+    sed -e "s/_END_/${EventID} End: ${OUTPUTTIME_DATE}/"              | \
+    sed -e "s/_MSG0001_/${MSG0001}/"                                  | \
+    mail -s "${SUBJECT0001}"                                            \
+      -S "smtp=smtp://${MTA}:25"                                        \
+      -r ${MAILFROM} ${MAILTO}
+MAILSENTSTATS=$(echo $?)
+
+if [ 0 = ${MAILSENTSTATS} -a -f ${OUTPUTFILE} ];
+then
+  rm -f ${TRIGGERFILE}
+fi
+

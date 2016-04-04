@@ -1,0 +1,363 @@
+#!/bin/bash
+set -uex
+LANG=C
+
+TARGETHOST=${1}
+MAILFROM=nullpopopo@example.com
+MAILTO=nullpopopo@example.com
+MTA=mail.example.com
+TIMEOUT=3
+
+# Usage: 
+# ${PROGNAME} ${TARGETHOST} ${PROTO}
+# TARGETHOST: target hostname or target IPv4 Address
+# PROTO: DNS PING HTTP HTTPS SSH
+# SSHポートが22以外の場合は引数の3番目にポート番号を正の整数値で指定すること
+
+[ 0 = $(echo ${2} | egrep ^[dD][nN][sS]$ > /dev/null ; echo $?) ] && PROTO=DNS
+[ 0 = $(echo ${2} | egrep ^[pP][iI][nN][gG]$ > /dev/null ; echo $?) ] && PROTO=PING
+[ 0 = $(echo ${2} | egrep "^([hH][tT]{2}[pP]|[hH][tT]{2}[pP][sS])$" > /dev/null ; echo $?) ] && PROTO=HTTP
+[ 0 = $(echo ${2} | egrep ^[sS]{2}[hH]$ > /dev/null ; echo $?) ] && PROTO=SSH
+[ 0 = $(echo $@ | egrep ^[tT][eE][sS][tT] > /dev/null ; echo $?) ] && PROTO=TEST
+
+#ミキサーの音量(%)を正の整数値で変数に格納する
+MASTERVOLUME=80
+TESTVOLUME=10
+FULLVOLUME=100
+
+# 警告音の再生ループ回数を変数に格納する
+LOOPTIMES=3
+
+# 警告音ダウンロード元を変数に格納する
+SOUNDURI="http://www.kurage-kosho.info/mp3/warning04.mp3"
+
+MPG321URI="ftp://ftp.pbone.net/mirror/www-ccrma.stanford.edu/planetccrma/mirror/fedora/linux/planetccrma/23/x86_64/mpg321-0.2.13-3.fc23.ccrma.x86_64.rpm"
+
+PROGNAME=$(basename ${0})
+APPDIR=${HOME}/Dropbox/APPS/${PROGNAME}
+
+# 有効な引数かどうかを判別するためのegrepに渡す引数を変数に格納する
+PROTOCOLS="^(dns|ping|ssh|http|test)$"
+
+LOG_TIME=$(date +%Y/%m/%d%t%H:%M:%S)
+MSG0="${LOG_TIME}\t${PROGNAME}\t${TARGETHOST}\t${PROTO}\tOK"
+SUBJECT0="[NOTICE] ${PROGNAME} ${TARGETHOST} ${PROTO} OK"
+MSG1="${LOG_TIME}\t${PROGNAME}\t${TARGETHOST}\t${PROTO}\tNG"
+SUBJECT1="[ALERT] ${PROGNAME} ${TARGETHOST} ${PROTO} NG"
+MSG2="${LOG_TIME}\t${PROGNAME}\tnmap is not installed."
+SUBJECT2="[ERROR] ${PROGNAME} nmap is not installed."
+MSG_TEST="${LOG_TIME}\t${PROGNAME}\tTEST was Completed."
+
+#LOGDIR=${HOME}/logs/${PROGNAME}/$(date +%Y%m)
+LOGFILE=${LOGDIR}/${PROGNAME}.log
+ERRORLOG=${LOGDIR}/${PROGNAME}_ERROR.log
+
+SOUNDDIR=${APPDIR}/SOUNDS
+SOUNDFILE=${SOUNDDIR}/$(basename ${SOUNDURI})
+TOTALSTOPFLAG=${APPDIR}/STOPALL_${PROGNAME}
+SOUNDSTOPFLAG=${APPDIR}/STOPSOUND_${PROGNAME}
+
+# DNS関数で入力(引数1)がホスト名かIPv4アドレスかを判別するためのegrepに渡す引数を変数に格納する
+IPREGEX="^(([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([1-9]?[0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$"
+
+# SSH関数で入力(引数1)がFQDNであるかを判別するためのegrepに渡す引数を変数に格納する
+FQDNREGEX="^(([A-Za-z0-9][A-Za-z0-9\-]{1,61}[A-Za-z0-9]\.)+[A-Za-z]+|[0-9.]*)$"
+
+PROTOMSG=$(echo ${PROTOCOLS} | sed -e "s/[\^\(\)\$]//g")
+USAGE(){
+echo -e "USAGE: ${PROGNAME} TARGETHOST PROTOCOL \nPROTOCOL: <${PROTOMSG}>"
+}
+
+# もしプログラムに与えられた引数が1つで、かつ引数が usage or help であれば使い方を示して正常終了させる
+if [ $# = 1 -a 0 = $(echo ${1} | egrep -i '(usage|help)' > /dev/null ; echo $?) ];
+then
+  USAGE && exit 0
+fi
+
+# もしプログラムに与えられた引数が1つで、かつ引数が usage or help or testでなければ使い方を示して異常終了させる
+if [ $# = 1 -a ! 0 = $(echo ${1} | egrep -i '(usage|help|test)' > /dev/null ; echo $?) ];
+then
+  USAGE && exit 1
+fi
+
+# もしプログラムに与えられた引数が2つ以上で、かつ引数の2番目が引数リストになければ使い方を示して異常終了させる
+if [ $# -ge 2 -a 0 = $(echo ${2} | egrep -iv ${PROTOCOLS} > /dev/null ; echo $?) ];
+then
+  USAGE && exit 1
+fi
+
+# 2番目の引数がプロトコル一覧にない場合は使い方を示して異常終了させる
+if [ 2 = $# -o 3 = $# ];
+then
+  if [ ! 0 = $(echo ${2} | egrep ${PROTOCOLS} > /dev/null ; echo $?) ];
+  then
+    USAGE && exit 1
+  fi
+fi
+
+# nmapがインストールされていなければ異常終了させる
+if [ ! 0 = $(rpm -ql nmap > /dev/null ; echo $?) ];
+then
+  echo -e "${MSG2}" | tee -a {${LOGFILE},${ERRORLOG}}
+  exit 1
+fi
+
+
+################################################################################################
+# 入力チェック
+if [ ! 0 = $(echo $@ | egrep -i '([[:space:]]*test[[:space:]]*)' > /dev/null ; echo $?) ];
+then
+  # ステータスおよびフラグ格納ディレクトリを変数に格納する
+  if [ ${PROTO} = HTTP ];
+  then
+    # http(s)監視を行う場合のステータスを変数に格納する前に値を綺麗にする
+    WEBTARGET=$(echo ${TARGETHOST} | sed -e "s/^https:\/\///i;s/^http:\/\///i;s/\/index\.[[:alnum:]]*$//i")
+    STATDIR=${APPDIR}/STATS/${PROTO}/$(date +%Y%m)/${WEBTARGET}
+    STATFILE=${STATDIR}/STATFILE_${PROGNAME}
+    FLAGDIR=${APPDIR}/FLAGS/${WEBTARGET}/${PROTO}
+    TRIGGERFILE=${FLAGDIR}/TRIGGERFILE.txt
+  else
+    STATDIR=${APPDIR}/STATS/${PROTO}/$(date +%Y%m)/${TARGETHOST}
+    STATFILE=${STATDIR}/STATFILE_${PROGNAME}_${TARGETHOST}_${PROTO}
+    FLAGDIR=${APPDIR}/FLAGS/${TARGETHOST}/${PROTO}
+    TRIGGERFILE=${FLAGDIR}/TRIGGERFILE.txt
+  fi
+
+  # SSH監視引数の入力チェックを行う
+  if [ ${PROTO} = SSH ];
+  then
+    # 引数が正の整数値でなければ使い方を示して異常終了させる
+    if [ ! 0 = $(echo ${2} | egrep ${FQDNREGEX} > /dev/null ; echo $?) -a 0 = $(echo ${3} | egrep "^([0-9]*)$" > /dev/null ; echo $?) ];
+    then
+      TCPALLOWMINPORT=1
+      TCPALLOWMAXPORT=65535
+      if [ $# = 3 ];
+      then
+        if [ ! ${3} -gt ${TCPALLOWMINPORT} -o ! ${3} -lt ${TCPALLOWMAXPORT} ];
+        then
+          USAGE && exit 1
+        else
+          SSHDEFPORT=22
+          SSHPORT=${3:-$SSHDEFPORT}
+        fi
+      fi
+      if [ $# = 2 ];
+      then
+        SSHPORT=22
+      fi
+    else
+      USAGE && exit 1
+    fi
+  fi
+fi
+################################################################################################
+
+DNS() {
+if [ ! 0 = $(echo ${TARGETHOST} | egrep ${IPREGEX} > /dev/null ; echo $?) ];
+then
+  dig ${TARGETHOST} > /dev/null
+else
+  dig -x ${TARGETHOST} > /dev/null
+fi
+}
+
+PING() {
+ping -c 1 -i 1 -w 1 ${TARGETHOST} > /dev/null
+}
+
+HTTP(){
+curl -LI ${WEBTARGET} --connect-timeout ${TIMEOUT} -o /dev/null -w '%{http_code}\n' -s
+}
+
+SSH(){
+timeout -s 9 ${TIMEOUT} nmap -Pn -p${SSHPORT} ${TARGETHOST} | awk "\$1 ~ /$SSHPORT/ {print \$2}" | grep open > /dev/null
+}
+
+
+
+# OSの種類を判別する
+if [ $(uname -s) = Linux ]
+then
+  # ディストリビューションの種類を判別する
+  [ -f /etc/redhat-release ] && \
+  DISTNAME=$(cat /etc/redhat-release | awk '{print $1}')
+  [ ${DISTNAME} = Fedora ] && DISTVERSION=$(cat /etc/redhat-release | awk '{print $3}')
+  [ 0 = $(cat /etc/issue | grep ^Ubuntu > /dev/null ; echo $?) ] && \
+  DISTNAME=$(grep . /etc/issue | awk '{print $1}')
+fi
+
+# mpg321とffmpegとalsa-utilsがインストールされていなければインストールする
+if [ ${DISTNAME} = Fedora ];
+then
+  if [ ${DISTVERSION} = 23 ];
+  then
+    mkdir -p ${HOME}/src/mpg321
+    if [ ! 0 = $(rpm -q mpg321 > /dev/null ; echo $?) ];
+    then
+      cd ${HOME}/src/mpg321
+      curl -LO ${MPG321URI}
+      sudo dnf -y install $(basename ${MPG321URI})
+      cd
+    fi
+    if [ ! 0 = $(rpm -q ffmpeg > /dev/null ; echo $?) ];
+    then
+      sudo dnf -y install ffmpeg{,-compat,-libs}
+    fi
+    if [ ! 0 = $(rpm -q alsa-utils > /dev/null ; echo $?) ];
+    then
+      sudo dnf -y install alsa-utils
+    fi
+  fi
+fi
+#if [ ${DISTNAME} = Ubuntu ]; then
+#  sudo apt-get -y install mpg321
+#  sudo apt-get -y install nscd
+#  mkdir -p ${HOME}/src/ffmpeg
+#  cd ${HOME}/src/ffmpeg
+#  wget "http://johnvansickle.com/ffmpeg/releases/ffmpeg-release-64bit-static.tar.xz"
+#  tar xvf ffmpeg-release-64bit-static.tar.xz
+#  sudo cp -p ./ffmpeg-release-64bit-static/ffmpeg /usr/local/bin
+#  cd
+#  sudo apt-get -y install alsa-utils
+#fi
+
+# この時点でmpg321がインストールされていなければ(実行不可であれば)異常終了する
+PLAYER=$(which mpg321)
+FFMPEG=$(which ffmpeg)
+[ ! 0 = $(which ${PLAYER} > /dev/null ; echo $?) ] && exit 1
+
+# サウンドファイルをダウンロードしてボリュームを上げておく
+mkdir -p ${SOUNDDIR}
+if [ ! -f ${SOUNDFILE} ]; then
+  curl -Lo ${SOUNDFILE} ${SOUNDURI}
+  ORIGFILE=$(echo ${SOUNDFILE} | sed -e "s/\.mp3/_ORIG.mp3/")
+  mv ${SOUNDFILE} ${ORIGFILE}
+  ${FFMPEG} -i ${ORIGFILE} -vol 1024 ${SOUNDFILE}
+fi
+
+# スピーカーのミュートを解除し、マスターボリュームを設定する
+VOLUMECTL() {
+amixer sset Master on && amixer sset Master ${MASTERVOLUME}%
+# MASTERVOLUMEが64%未満であれば強制的に64%へ引き上げる
+FORCEVOL=64
+NOWVOL=$(amixer | egrep '(Playback[[:space:]][0-9]*[[:space:]]\[[0-9]*%\])' | awk '{print $5}' | sort | uniq | sed -e "s/\[//;s/%\]//")
+[ ${NOWVOL} -le ${FORCEVOL} ] && amixer sset Master ${FORCEVOL}%
+}
+
+# トリガー起動の関数
+## トリガーファイルがあり、かつストップフラグがなければ、フルボリュームで16回ループ
+TRIGGER() {
+  OPTIONS="--gain ${FULLVOLUME} --loop ${LOOPTIMES}"
+  [ -f ${TRIGGERFILE} -a ! -f ${SOUNDSTOPFLAG} ] && ${PLAYER} ${OPTIONS} ${SOUNDFILE}
+}
+
+# テスト起動の関数
+TEST() {
+if [ ! -f ${TOTALSTOPFLAG} ];
+then
+  OPTIONS="--gain ${TESTVOLUME} --loop 1"
+  if [ ! -f ${SOUNDSTOPFLAG} ];
+  then
+    ${PLAYER} ${OPTIONS} ${SOUNDFILE}
+    echo -e "${MSG_TEST}" | tee -a ${LOGFILE}
+  else
+    echo -e "${MSG_TEST} but $(basename ${SOUNDFILE}) is muted." | tee -a ${LOGFILE}
+  fi
+fi
+}
+
+# トリガーファイルを削除する関数
+CLEAR() {
+  rm -f ${TRIGGERFILE}
+}
+
+# ストップフラグを生成する関数
+MUTE() {
+  touch ${STOPFLAG}
+}
+
+# ボリュームを0にする関数
+FORCEMUTE() {
+  amixer sset Master off
+}
+
+
+OKACTION() {
+[ -f ${TRIGGERFILE} ] && rm -f ${TRIGGERFILE}
+echo -e "${MSG0}" | tee -a ${LOGFILE}
+}
+
+ERRORACTION() {
+echo -e "${MSG1}" | \
+mail -s "${SUBJECT1}" -S "smtp=smtp://${MTA}:25" -r ${MAILFROM} ${MAILTO} | \
+tee -a {${LOGFILE},${ERRORLOG}}
+touch ${TRIGGERFILE}
+VOLUMECTL
+TRIGGER
+}
+
+
+# curlだけはhttpのステータスコードで判別する
+ACTION_HTTP() {
+CURLSTATS=$(${PROTO})
+STATMSG="${LOG_TIME}\t${PROGNAME}\t${TARGETHOST}\thttp status: ${CURLSTATS}"
+echo -e "${STATMSG}" | tee -a ${STATFILE}
+if [ ! 000 = ${CURLSTATS} ];
+then
+  OKACTION
+else
+  ERRORACTION
+fi
+}
+
+ACTION_SSH() {
+${PROTO}
+if [ 0 = $(echo $?) ];
+then
+  OKACTION
+else
+  ERRORACTION
+fi
+}
+
+# testアクションだけは正常終了のみとする
+ACTION_TEST() {
+${PROTO}
+[ -f ${TRIGGERFILE} ] && rm -f ${TRIGGERFILE}
+}
+
+
+mkdir -p ${STATDIR} ${FLAGDIR}
+################################################################################################
+# 監視コマンド本体
+if [ ! -f ${TOTALSTOPFLAG} ];
+then
+  if [ 0 = $(echo ${PROTO} | egrep -i http > /dev/null ; echo $?) ];
+  then
+    ACTION_HTTP
+  fi
+
+  if [ 0 = $(echo ${PROTO} | egrep -i ssh > /dev/null ; echo $?) ];
+  then
+    ACTION_SSH
+  fi
+
+  if [ 0 = $(echo ${PROTO} | egrep -i test > /dev/null ; echo $?) ];
+  then
+    ACTION_TEST
+  fi
+
+  if [ ! 0 = $(echo ${PROTO} | egrep -i '(http|ssh|test)' > /dev/null ; echo $?) ];
+  then
+    ${PROTO}
+    if [ 0 = $(echo $?) ];
+    then
+      [ -f ${TRIGGERFILE} ] && rm -f ${TRIGGERFILE}
+      echo -e "${MSG0}" | tee -a ${LOGFILE}
+    else
+      touch ${TRIGGERFILE}
+      TRIGGER
+      echo -e "${MSG1}" | tee -a {${LOGFILE},${ERRORLOG}}
+    fi
+  fi
+fi

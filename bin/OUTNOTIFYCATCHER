@@ -1,0 +1,208 @@
+#!/bin/bash
+set -uex
+LANG=C
+
+EventID=test0001
+
+MTA=mail.example.com
+MAILFROM=admin@example.com
+MAILTO=nullpopopo@example.com
+
+
+#ミキサーの音量(%)を正の整数値で変数に格納する
+MASTERVOLUME=80
+
+# 警告音ダウンロード元を変数に格納する
+SOUNDDL_GREPWORD="携帯着信02"
+SOUNDDL_BASEURI="http://on-jin.com/sound/meka.php"
+SOUNDDL_BASEDIR=$(dirname ${SOUNDDL_BASEURI})
+SOUNDDL_FILEURI=$(curl -s ${SOUNDDL_BASEURI}       | \
+                  egrep -A 100 ${SOUNDDL_GREPWORD} | \
+                  egrep mp3                        | \
+                  head -n 1                        | \
+                  awk '{print $2}'                 | \
+                  sed -e "s/href=//;s/\"//g")
+SOUNDURI=${SOUNDDL_BASEDIR}/${SOUNDDL_FILEURI}
+
+MPG321URI="ftp://ftp.pbone.net/mirror/www-ccrma.stanford.edu/planetccrma/mirror/fedora/linux/planetccrma/23/x86_64/mpg321-0.2.13-3.fc23.ccrma.x86_64.rpm"
+
+PROGNAME=$(basename ${0})
+PROJECTNAME=MESH
+BASEDIR=${HOME}/Dropbox
+TRIGGERDIR=${BASEDIR}/APPS/${PROGNAME}
+TRIGGERFILE=${TRIGGERDIR}/ENDNOTIFY_${EventID}.txt
+
+FLAGDIR=${BASEDIR}/FLAGS
+STOPFLAG=${FLAGDIR}/stop.txt
+SOUNDDIR=${BASEDIR}/SOUNDS
+SOUNDFILE=${SOUNDDIR}/$(basename ${SOUNDURI})
+[ ! -f ${TRIGGERFILE} ] && CLEAR
+
+NOWDATE=$(date +%s)
+ALERTDATE=$(cat ${TRIGGERFILE})
+
+TRIGGER_TIMESTAMP_DATE=$(echo ${ALERTDATE} | awk '{print strftime("%Y-%m-%d %H:%M",$1)}')
+MSG0001="Washing machine has stopped at ${TRIGGER_TIMESTAMP_DATE}"
+SUBJECT0001="[${PROJECTNAME}][${EventID}] ${MSG0001}"
+
+# Dropboxの同期ができていなければDropboxを再起動させて異常終了させる。
+DROPBOXPY_STATUS=$(dropbox.py status | egrep '(最新の状態|Up to date)' > /dev/null ; echo $?)
+if [ ! 0 = ${DROPBOXPY_STATUS} ];
+then
+  dropbox.py stop
+  dropbox.py start
+  exit 1
+fi
+
+mkdir -p ${BASEDIR} ${TRIGGERDIR} ${FLAGDIR} ${SOUNDDIR}
+
+# OSの種類を判別する
+if [ $(uname -s) = Linux ]
+then
+  # ディストリビューションの種類を判別する
+  [ -f /etc/redhat-release ] && \
+  DISTNAME=$(cat /etc/redhat-release | awk '{print $1}')
+  [ ${DISTNAME} = Fedora ] && DISTVERSION=$(cat /etc/redhat-release | awk '{print $3}')
+  [ 0 = $(cat /etc/issue | grep ^Ubuntu > /dev/null ; echo $?) ] && \
+  DISTNAME=$(grep . /etc/issue | awk '{print $1}')
+fi
+if [ $(uname -s) = FreeBSD ]
+then
+  :
+fi
+
+# mpg321とffmpegとalsa-utilsがインストールされていなければインストールする
+if [ ${DISTNAME} = Fedora ]; then
+  if [ ${DISTVERSION} = 23 ]; then
+    mkdir -p ${HOME}/src/mpg321
+    if [ ! 0 = $(rpm -q mpg321 > /dev/null ; echo $?) ] ;then
+      cd ${HOME}/src/mpg321
+      curl -LO ${MPG321URI}
+      sudo dnf -y install $(basename ${MPG321URI})
+      cd
+    fi
+    if [ ! 0 = $(rpm -q ffmpeg > /dev/null ; echo $?) ] ;then
+      sudo dnf -y install ffmpeg{,-compat,-libs}
+    fi
+    if [ ! 0 = $(rpm -q alsa-utils > /dev/null ; echo $?) ] ;then
+      sudo dnf -y install alsa-utils
+    fi
+  fi
+fi
+if [ ${DISTNAME} = Ubuntu ]; then
+  sudo apt-get -y install mpg321
+  sudo apt-get -y install nscd
+  mkdir -p ${HOME}/src/ffmpeg
+  cd ${HOME}/src/ffmpeg
+  wget "http://johnvansickle.com/ffmpeg/releases/ffmpeg-release-64bit-static.tar.xz"
+  tar xvf ffmpeg-release-64bit-static.tar.xz
+  sudo cp -p ./ffmpeg-release-64bit-static/ffmpeg /usr/local/bin
+  cd
+  sudo apt-get -y install alsa-utils
+fi
+
+# この時点でmpg321がインストールされていなければ(実行不可であれば)異常終了する
+PLAYER=$(which mpg321)
+FFMPEG=$(which ffmpeg)
+[ ! 0 = $(which ${PLAYER} > /dev/null ; echo $?) ] && exit 1
+
+# サウンドファイルをダウンロードしてボリュームを上げておく
+## 当初は1024にしていたが音割れするので512にした
+if [ ! -f ${SOUNDFILE} ]; then
+  curl -Lo ${SOUNDFILE} ${SOUNDURI}
+  ORIGFILE=$(echo ${SOUNDFILE} | sed -e "s/\.mp3/_ORIG.mp3/")
+  mv ${SOUNDFILE} ${ORIGFILE}
+  ${FFMPEG} -i ${ORIGFILE} -vol 512 ${SOUNDFILE}
+fi
+
+# スピーカーのミュートを解除し、マスターボリュームを設定する
+VOLUMECTL() {
+amixer sset Master on && amixer sset Master ${MASTERVOLUME}%
+# MASTERVOLUMEが64%未満であれば強制的に64%へ引き上げる
+FORCEVOL=64
+NOWVOL=$(amixer | egrep '(Playback[[:space:]][0-9]*[[:space:]]\[[0-9]*%\])' | awk '{print $5}' | sort | uniq | sed -e "s/\[//;s/%\]//")
+[ ${NOWVOL} -le ${FORCEVOL} ] && amixer sset Master ${FORCEVOL}%
+}
+
+# トリガー起動の関数
+## トリガーファイルがあり、かつストップフラグがなければ、ボリューム64%で3回ループ
+TRIGGER() {
+  OPTIONS="--gain ${FORCEVOL} --loop 3"
+  [ -f ${TRIGGERFILE} -a ! -f ${STOPFLAG} ] && ${PLAYER} ${OPTIONS} ${SOUNDFILE}
+}
+
+# テスト起動の関数
+TEST() {
+  OPTIONS="--gain 40 --loop 1"
+  [ ! -f ${STOPFLAG} ] && ${PLAYER} ${OPTIONS} ${SOUNDFILE}
+}
+
+# トリガーファイルを削除する関数
+CLEAR() {
+  [ -f ${TRIGGERFILE} ] && rm -f ${TRIGGERFILE} || :
+}
+
+# ストップフラグを生成する関数
+MUTE() {
+  touch ${STOPFLAG}
+}
+
+# ストップフラグを削除する関数
+UNMUTE() {
+  [ -f ${STOPFLAG} ] && rm -f ${STOPFLAG} || :
+}
+
+# ボリュームを0にする関数
+FORCEMUTE() {
+  amixer sset Master off
+}
+
+MAIL_SEND(){
+cat ${TRIGGERFILE}                                                                 | \
+    sed -e "s/${ALERTDATE}/${MSG0001}/"                                            | \
+    mail -s "${SUBJECT0001}" -S "smtp=smtp://${MTA}:25" -r ${MAILFROM} ${MAILTO}
+MAILSENTSTATS=$(echo $?)
+if [ 0 = ${MAILSENTSTATS} -a -f ${TRIGGERFILE} ];
+then
+  rm -f ${TRIGGERFILE}
+fi
+}
+
+if [ ! 0 = $# ];
+  then
+    case "$1" in
+      [tT][rR][iI][gG][gG][eE][rR])
+        if [ ${NOWDATE} -ge ${ALERTDATE} ];
+        then
+          VOLUMECTL
+          TRIGGER
+          MAIL_SEND
+        fi
+        ;;
+      [tT][eE][sS][tT])
+        VOLUMECTL
+        TEST
+        ;;
+      [cC][lL][eE][aA][rR])
+        VOLUMECTL
+        CLEAR
+        ;;
+      [mM][uU][tT][eE])
+        VOLUMECTL
+        MUTE
+        ;;
+      [uU][nN][mM][uU][tT][eE])
+        VOLUMECTL
+        UNMUTE
+        ;;
+      [fF][oO][rR][cC][eE][mM][uU][tT][eE])
+        FORCEMUTE
+        ;;
+      *)
+        echo "USAGE: $(basename ${PROGNAME}) <test|trigger|clear|mute|unmute|forcemute>"
+        ;;
+    esac
+  else
+    echo "USAGE: $(basename ${PROGNAME}) <test|trigger|clear|mute|unmute|forcemute>"
+fi
+

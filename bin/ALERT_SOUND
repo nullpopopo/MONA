@@ -1,0 +1,152 @@
+#!/bin/bash
+set -uex
+LANG=C
+
+#ミキサーの音量(%)を正の整数値で変数に格納する
+MASTERVOLUME=80
+
+# 警告音ダウンロード元を変数に格納する
+SOUNDURI="http://www.kurage-kosho.info/mp3/warning04.mp3"
+
+MPG321URI="ftp://ftp.pbone.net/mirror/www-ccrma.stanford.edu/planetccrma/mirror/fedora/linux/planetccrma/23/x86_64/mpg321-0.2.13-3.fc23.ccrma.x86_64.rpm"
+
+PROGNAME=$(basename ${0})
+BASEDIR=${HOME}/Dropbox/APPS/${PROGNAME}
+FLAGDIR=${BASEDIR}/FLAGS
+TRIGGERFILE=${FLAGDIR}/TRIGGERFILE.txt
+STOPFLAG=${FLAGDIR}/stop.txt
+SOUNDDIR=${BASEDIR}/SOUNDS
+SOUNDFILE=${SOUNDDIR}/$(basename ${SOUNDURI})
+LOGDIR=${BASEDIR}/LOGS
+LOGFILE=${LOGDIR}/$(date +%Y%m%d)_${PROGNAME}.log
+LOG_TIME=$(date +%Y/%m/%d%t%H:%M:%S)
+
+# ログに記録するメッセージを変数に格納する
+MSG_TRIGGER="Trigger is pulled."
+
+# OSの種類を判別する
+if [ $(uname -s) = Linux ]
+then
+  # ディストリビューションの種類を判別する
+  [ -f /etc/redhat-release ] && \
+  DISTNAME=$(cat /etc/redhat-release | awk '{print $1}')
+  [ ${DISTNAME} = Fedora ] && DISTVERSION=$(cat /etc/redhat-release | awk '{print $3}')
+  [ 0 = $(cat /etc/issue | grep ^Ubuntu > /dev/null ; echo $?) ] && \
+  DISTNAME=$(grep . /etc/issue | awk '{print $1}')
+fi
+if [ $(uname -s) = FreeBSD ]
+then
+  :
+fi
+
+# mpg321とffmpegとalsa-utilsがインストールされていなければインストールする
+if [ ${DISTNAME} = Fedora ]; then
+  if [ ${DISTVERSION} = 23 ]; then
+    mkdir -p ${HOME}/src/mpg321
+    if [ ! 0 = $(rpm -q mpg321 > /dev/null ; echo $?) ] ;then
+      cd ${HOME}/src/mpg321
+      curl -LO ${MPG321URI}
+      sudo dnf -y install $(basename ${MPG321URI})
+      cd
+    fi
+    if [ ! 0 = $(rpm -q ffmpeg > /dev/null ; echo $?) ] ;then
+      sudo dnf -y install ffmpeg{,-compat,-libs}
+    fi
+    if [ ! 0 = $(rpm -q alsa-utils > /dev/null ; echo $?) ] ;then
+      sudo dnf -y install alsa-utils
+    fi
+  fi
+fi
+if [ ${DISTNAME} = Ubuntu ]; then
+  sudo apt-get -y install mpg321
+  sudo apt-get -y install nscd
+  mkdir -p ${HOME}/src/ffmpeg
+  cd ${HOME}/src/ffmpeg
+  wget "http://johnvansickle.com/ffmpeg/releases/ffmpeg-release-64bit-static.tar.xz"
+  tar xvf ffmpeg-release-64bit-static.tar.xz
+  sudo cp -p ./ffmpeg-release-64bit-static/ffmpeg /usr/local/bin
+  cd
+  sudo apt-get -y install alsa-utils
+fi
+
+# この時点でmpg321がインストールされていなければ(実行不可であれば)異常終了する
+PLAYER=$(which mpg321)
+FFMPEG=$(which ffmpeg)
+[ ! 0 = $(which ${PLAYER} > /dev/null ; echo $?) ] && exit 1
+
+# サウンドファイルをダウンロードしてボリュームを上げておく
+mkdir -p ${FLAGDIR} ${SOUNDDIR} ${LOGDIR}
+if [ ! -f ${SOUNDFILE} ]; then
+  curl -Lo ${SOUNDFILE} ${SOUNDURI}
+  ORIGFILE=$(echo ${SOUNDFILE} | sed -e "s/\.mp3/_ORIG.mp3/")
+  mv ${SOUNDFILE} ${ORIGFILE}
+  ${FFMPEG} -i ${ORIGFILE} -vol 1024 ${SOUNDFILE}
+fi
+
+# スピーカーのミュートを解除し、マスターボリュームを設定する
+VOLUMECTL() {
+amixer sset Master on && amixer sset Master ${MASTERVOLUME}%
+# MASTERVOLUMEが64%未満であれば強制的に64%へ引き上げる
+FORCEVOL=64
+NOWVOL=$(amixer | egrep '(Playback[[:space:]][0-9]*[[:space:]]\[[0-9]*%\])' | awk '{print $5}' | sort | uniq | sed -e "s/\[//;s/%\]//")
+[ ${NOWVOL} -le ${FORCEVOL} ] && amixer sset Master ${FORCEVOL}%
+}
+
+# トリガー起動の関数
+## トリガーファイルがあり、かつストップフラグがなければ、フルボリュームで16回ループ
+TRIGGER() {
+  OPTIONS="--gain 100 --loop 16"
+  [ -f ${TRIGGERFILE} -a ! -f ${STOPFLAG} ] && ${PLAYER} ${OPTIONS} ${SOUNDFILE}
+}
+
+# テスト起動の関数
+TEST() {
+  OPTIONS="--gain 10 --loop 1"
+  ${PLAYER} ${OPTIONS} ${SOUNDFILE}
+}
+
+# トリガーファイルを削除する関数
+CLEAR() {
+  rm -f ${TRIGGERFILE}
+}
+
+# ストップフラグを生成する関数
+MUTE() {
+  touch ${STOPFLAG}
+}
+
+# ボリュームを0にする関数
+FORCEMUTE() {
+  amixer sset Master off
+}
+
+if [ ! 0 = $# ];
+  then
+    case "$1" in
+      [tT][rR][iI][gG][gG][eE][rR])
+        VOLUMECTL
+        TRIGGER && \
+        echo -e "${LOG_TIME}\t${PROGNAME}\t${MSG_TRIGGER}" | tee -a ${LOGFILE}
+        ;;
+      [tT][eE][sS][tT])
+        VOLUMECTL
+        TEST
+        ;;
+      [cC][lL][eE][aA][rR])
+        VOLUMECTL
+        CLEAR
+        ;;
+      [mM][uU][tT][eE])
+        VOLUMECTL
+        MUTE
+        ;;
+      [fF][oO][rR][cC][eE][mM][uU][tT][eE])
+        FORCEMUTE
+        ;;
+      *)
+        echo "USAGE: $(basename ${PROGNAME}) <test|trigger|clear|mute|forcemute>"
+        ;;
+    esac
+  else
+    echo "USAGE: $(basename ${PROGNAME}) <test|trigger|clear|mute|forcemute>"
+fi
